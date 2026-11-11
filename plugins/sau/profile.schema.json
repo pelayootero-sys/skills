@@ -157,6 +157,10 @@
       "enum": ["blocking", "informative", "off"],
       "description": "blocking: P2 cannot be recorded without the reviewer's report for every page that requested it. informative: the report is attached when it exists and never blocks. off: no legal step. Whether a page requests a review is decided at P1."
     },
+    "aesthetic_agent": {
+      "type": "string",
+      "description": "Optional. Name of the subagent that reviews each page's preview before the person's P2 (preview gate, spec §4b): at most 3 rounds per cycle, and every cambiar of the person opens a new cycle. Without it, the preview goes straight to the person."
+    },
     "legal_agent": {
       "type": "string",
       "description": "Optional. Name of the subagent that writes the legal report (revision-legal*.md). Without it, running-sau asks the person for the report instead of dispatching an agent."

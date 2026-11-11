@@ -47,6 +47,8 @@ Unit directory: `P = OUT/<slug>/`. Site-wide files: `OUT/05-query-panel.csv` and
 
 Steps 4 and 5 may run before or after P4. The unit closes only when both have evidence and P4 is recorded.
 
+With `preview: url` (the default), C runs before P2: code, `checks` and a draft PR, then the preview gate (§4b), whose approval is P2.
+
 **Branches.** Page outputs and `estado.json` are committed by the orchestrator on `<branch_prefix><slug>` of `content_repo`; for a single-repository site that is the same branch as the code.
 
 **Pull request of the outputs.** When `content_repo` differs from `code_repo`, the orchestrator also pushes the outputs branch of `content_repo` (`<branch_prefix><slug>`) and opens a PR into `base_branch`. In page mode this happens at close; when both are the same repository, the outputs travel in the code PR at P3. Always with the person's OK, through `gate.sh`. At close, the orchestrator reminds the person to merge it, with explicit OK.
@@ -131,6 +133,99 @@ Published means a production deployment in `READY` with the commit (with `publis
 
 `legal_review: informative` never blocks any gate. The report is shown when it exists, and its absence is recorded as `missing`.
 
+## 4b. Preview gate (P2 when `preview` is `url`)
+
+When the profile has `preview: url` (the default), P2 is a **preview gate** in both modes: what the reviewer and the person look at and approve is the preview deployment of the page's branch, never the code or the draft. In page mode this moves step C before P2: code, `checks` and a **draft** PR first, then the preview, then P2. `state.py` needs no change for this: with C done and P2 not recorded, the next item is still P2.
+
+### Per-page states
+
+The orchestrator always knows, and reports in `estado`, which of these states each page (or seed) is in:
+
+| State | Meaning | Leaves when |
+|---|---|---|
+| `draft` | Draft PR open; no preview of the branch's last commit yet. | The provider deploys that commit (`preview ready`) or the block is detected (`preview blocked`). |
+| `preview blocked` | The provider refuses to deploy the last commit (for example, its author is not a member of the deployment team). Waits for an action of the person. | The person takes one of the three actions in A and the deployment is `READY`. |
+| `preview ready` | A preview URL of the last commit exists, answers HTTP 200 (or through a share link) and serves the page. | The aesthetic review starts (or, without `aesthetic_agent`, the person's gate). |
+| `aesthetic review vN` (cycle k) | `aesthetic_agent` reviews the preview, round N of 3 of cycle k. | Verdict "approved" or round 3 → `for the person`. Any other verdict → fix, commit, back to `draft` for round N+1. |
+| `for the person` (cycle k) | The person has the preview link and the last aesthetic report. | `aprobada`, `cambiar: …` or `descartada`. |
+| `changes requested` (cycle k+1) | The person asked for changes; they are being made. | Commit → `draft` → new preview → `aesthetic review v1` of cycle k+1. |
+| `approved` | The person approved the preview of one commit (SHA). P2 recorded. It is the OK to merge **that** page. | `checks` and the last pass green, merged into `base_branch` (P3). |
+| `merged` | P3 recorded; `checks` green on `base_branch`. | The person says to publish and P4 is recorded. |
+| `published` | P4 recorded, indexing requested (P4 rules), change registered. | End of SAU for the page. |
+| `discarded` | The person discarded it; its PR closed with a comment and recorded. | End. |
+
+```mermaid
+stateDiagram-v2
+    state "draft (draft PR)" as draft
+    state "preview blocked" as blocked
+    state "preview ready" as ready
+    state "aesthetic review vN (cycle k)" as review
+    state "for the person" as person
+    state "changes requested (cycle k+1)" as changes
+    state "approved (SHA)" as approved
+    state "merged (P3)" as merged
+    state "published (P4)" as published
+    state "discarded" as discarded
+
+    [*] --> draft
+    draft --> blocked: no deployment check, or author without access
+    blocked --> ready: manual deploy, team member's empty commit, or author added to the team
+    draft --> ready: deployment READY
+    ready --> review
+    review --> draft: not approved and N below 3, fix and commit (round N+1)
+    review --> person: approved, or round 3
+    person --> changes: cambiar
+    changes --> draft: commit with the changes (cycle k+1, round 1)
+    person --> approved: aprobada
+    person --> discarded: descartada
+    approved --> merged: checks, last pass, merge (P3)
+    merged --> published: publish, production READY (P4)
+    published --> [*]: indexing requested, registered
+    discarded --> [*]
+```
+
+### Loop rule
+
+- **At most 3 aesthetic rounds per cycle**, not per page. Every `cambiar` of the person opens a new cycle with its own 3 rounds, starting at round 1.
+- **The loop with the person has no cap.** Only the person closes it, with `aprobada` or `descartada`.
+- **Every round reviews the preview of the last commit.** A fix is a commit and a commit is a new preview: the next round starts only when that preview is `READY` with that SHA.
+- **No preview, no review.** Neither the reviewer nor the person reviews the code or the draft instead. The local check of `local_preview_cmd` (plan B) still serves for technical checks (status, title, H1, redirects), not for this gate.
+
+### A. Preview
+
+After every push to the page's branch (the first and every fix):
+
+1. Get the deployment of the branch's **last commit**: the PR checks (`gh pr checks <n> -R <code_repo>`), the deployment bot's comment on the PR, or `gh api "repos/<code_repo>/deployments?ref=<branch>"` → first `id` → `.../statuses` → `environment_url`, checking that the deployment's `sha` is the branch head.
+2. Check that the page answers HTTP 200 at `<url>/<page path>`, not a redirect to a login. If it asks for a login, use the provider's share link.
+3. **Blocked preview: detect it and ask, never wait in silence.** Signals: the bot comment says `Blocked` or that the author "must be a member of the team" / "must have access"; the deployment check fails; or `gh pr checks` reports no checks a few minutes after the push. Then the page is `preview blocked` and the orchestrator tells the person **at once** (one message for every branch of a tanda), with repository, branch, PR and SHA filled in and three ways out: (1) deploy it by hand from the provider's dashboard with a team account (the link in the bot comment); (2) an empty commit by a team member as the branch's last commit; (3) add the commit author to the deployment team (the only one that removes the block for good: with the other two, every fix in the loop blocks again; it may cost money, so the person decides). Site-specific details (accounts, guides) go in the profile's `publish_notes`.
+
+### B. Aesthetic review on the preview
+
+Only when the profile sets `aesthetic_agent`. The orchestrator dispatches it with: the page URL in the preview (share link when needed) and its SHA, widths 1440 and 390 px, the site, the primary keyword, the draft and keyword-map paths, "round N of 3, cycle k", the previous report from round 2, and, in round 1 of a cycle k ≥ 2, the person's literal change list plus the last report of the previous cycle. Reports are saved outside the repositories when they carry private criteria; only the verdict, round and cycle go into `entrega.md` or the unit's notes. Report names: `…-v<N>.md` in cycle 1, `…-c<k>-v<N>.md` from cycle 2.
+
+- Verdict "approved" → `for the person`.
+- Any other verdict with N < 3 → the orchestrator dispatches the fix (in page mode, in the session or a `sau-step` with `steps: [C]` and `fix`; in a tanda, the seed's `sau-step` with `fix`) on the page's branch, with only the accepted findings. The fix ends in a commit and a push (by the orchestrator, through `gate.sh`) → A → round N+1.
+- Round 3 without approval → `for the person`, with the report's section for the person. There is no round 4 without the person.
+- A fix that touches text, title, meta, headings or links runs `onpage-optimizer` again before the new preview: the score must stay ≥ `onpage_min`.
+
+Without `aesthetic_agent`, B is skipped and the page goes from `preview ready` to `for the person`.
+
+### C. The person's gate (P2)
+
+Shown per page: the page link in the preview and its SHA, the last aesthetic report (verdict, round, cycle, what is still open; at round 3 without approval, its section for the person), the PR, the on-page score and, from cycle 2, what changed since the person last looked. Answers:
+
+- **`aprobada`** → record P2 with `verdict: aprobada`, `preview_sha` and `cycle`. Go to D.
+- **`cambiar: …`** → the earlier verdict moves to `history`; state `changes requested` (cycle k+1). The person's changes are applied exactly (text or SEO changes also through `onpage-optimizer`), commit and push → A → `aesthetic_agent` round 1 of cycle k+1, which first checks each requested change (done / partly / not done, with a capture) and then sweeps the whole page again → up to 3 rounds → back to C. What the person asks for wins over the reviewer's rules: the reviewer may say in one line that it clashes with a rule and propose revising the rule, but does not undo it.
+- **`descartada`** → record P2 with `verdict: descartada`; close the PR with a comment saying it was discarded at the preview gate, with the date. Its branch is deleted only with the person's OK.
+
+A delegated OK ("once seen, approved") counts for that page and that cycle only.
+
+### D. Approved → published
+
+1. **The approval is for a SHA.** If the branch gets commits after the approved preview that change what is seen, the page goes back to `for the person` with the change explained. Empty deploy commits do not count.
+2. P3 as in §4: `checks` run in the session and the last pass. Under the preview gate, **the person's `aprobada` for that page is the OK to merge that page** (only that page): `gh pr ready` and `gh pr merge`, without asking again. In a tanda, one at a time in reparto order. Anything fixed in the last pass that changes what is seen sends the page back to `for the person`.
+3. P4 as in §4, only when the person says to publish: the approval of a page is not the OK to publish. The production deployment goes through the same block detection as A. Requesting indexing is part of P4. Then registration (`sar_register`, tracker, `entrega.md`).
+
 ## 5. `estado.json`
 
 Page mode: `OUT/<slug>/estado.json`. Tanda mode: `T/estado.json`. UTF-8, two-space indent. Every gate record has `at` (ISO 8601 with offset), `by` (who approved, as the person wrote it or as the session identifies them) and optionally `note`. Unknown keys are kept on rewrite.
@@ -187,6 +282,8 @@ Tanda mode: P1, P4 and close are tanda-level; P2 and P3 are per seed.
 ```
 
 A seed with `verdict: descartada` is out of the tanda. A seed with `verdict: cambiar` gets its P2 record replaced when it is approved later; the earlier verdict moves to `history` (an array on the seed) so nothing the person decided is lost.
+
+Under the preview gate (§4b), P2 also carries `verdict` in page mode (earlier `cambiar` verdicts go to `history` on the unit), `preview_sha` (the commit whose preview was approved) and `cycle` (1 + the number of `cambiar` verdicts in `history`). Aesthetic rounds are not gates and are not recorded here.
 
 ## 6. Enforcement: what each hook holds
 
